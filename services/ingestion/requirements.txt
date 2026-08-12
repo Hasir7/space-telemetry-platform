@@ -5,3 +5,4 @@ pymongo==4.14.0
 redis==6.4.0
 cassandra-driver==3.29.2
 neo4j==5.28.2
+pytest==8.3.4

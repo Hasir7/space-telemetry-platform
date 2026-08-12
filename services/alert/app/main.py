@@ -24,7 +24,7 @@ def evaluate(satellite_id: str):
     if temp > 80:
         alerts.append({"satellite_id":satellite_id,"type":"HIGH_TEMPERATURE","severity":"critical","value":temp,"threshold":80})
     if battery < 20:
-        alerts.append({"satellite_id":satellite,"type":"LOW_BATTERY","severity":"warning","value":battery,"threshold":20})
+        alerts.append({"satellite_id":satellite_id,"type":"LOW_BATTERY","severity":"warning","value":battery,"threshold":20})
     for a in alerts:
         a["timestamp"]=datetime.now(timezone.utc).isoformat()
         db.alerts.insert_one(dict(a))
