@@ -23,6 +23,8 @@ jobs:
       - name: Install dependencies
         working-directory: services/${{ matrix.service }}
         run: pip install -r requirements.txt
+      - name: Install test dependencies
+        run: pip install pytest
       - name: Compile
         working-directory: services/${{ matrix.service }}
         run: python -m compileall app
