@@ -1,26 +1,26 @@
 # Space Telemetry Platform
 
-A polyglot NoSQL capstone that ingests satellite telemetry, maintains live
-health, stores time-series history, models sensor dependencies, and evaluates
-mission alerts. Each datastore is selected for a distinct access pattern.
+This is a cloud-based satellite telemetry project built for the NoSQL Cloud Datastore capstone.
 
-## Production
+The system creates sample satellite sensor data, stores it in different NoSQL databases, checks satellite health, creates alerts, and shows the information on a web dashboard.
+
+## Live Project
 
 - Dashboard: <https://red-pebble-048b99600.7.azurestaticapps.net>
 - API: <https://space-telemetry-api.mangosea-feb17010.southindia.azurecontainerapps.io>
-- Ingestion: <https://space-telemetry-ingestion.mangosea-feb17010.southindia.azurecontainerapps.io>
-- Alert: <https://space-telemetry-alert.mangosea-feb17010.southindia.azurecontainerapps.io>
+- Ingestion Service: <https://space-telemetry-ingestion.mangosea-feb17010.southindia.azurecontainerapps.io>
+- Alert Service: <https://space-telemetry-alert.mangosea-feb17010.southindia.azurecontainerapps.io>
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    UI[React dashboard\nStatic Web Apps Free] --> API[FastAPI API\nContainer Apps]
-    GEN[Ingestion service\nContainer Apps] --> M[(Cosmos DB\nMongoDB API)]
-    GEN --> R[(Azure Managed Redis)]
-    GEN --> C[(Cosmos DB\nCassandra API)]
-    GEN --> N[(Neo4j AuraDB Free)]
-    ALERT[Alert service\nContainer Apps] --> M
+    UI[React Dashboard] --> API[FastAPI API]
+    GEN[Ingestion Service] --> M[(MongoDB)]
+    GEN --> R[(Redis)]
+    GEN --> C[(Cassandra)]
+    GEN --> N[(Neo4j)]
+    ALERT[Alert Service] --> M
     ALERT --> R
     API --> M
     API --> R
@@ -28,89 +28,161 @@ flowchart LR
     API --> N
 ```
 
-Container Apps and Redis run in South India. Cosmos DB for MongoDB and
-Cassandra run in Central India because new Cosmos capacity in South India was
-blocked. Static Web Apps uses its supported East Asia control-plane region and
-serves the site globally. Neo4j AuraDB Free is externally managed by Neo4j.
+The backend services run on Azure Container Apps. The frontend is hosted on Azure Static Web Apps.
 
-See [docs/architecture.md](docs/architecture.md) for deployment detail.
+MongoDB and Cassandra use Azure Cosmos DB. Redis uses Azure Managed Redis. Neo4j uses Neo4j AuraDB Free.
 
-## Services
+## Main Services
 
-- **API** — health, current mission health, telemetry history, alerts, and
-  satellite/sensor dependency reads.
-- **Ingestion** — generates telemetry and writes one packet to all four data
-  models.
-- **Alert** — evaluates Redis health for high temperature (`> 80°C`) and low
-  battery (`< 20%`), stores alerts in MongoDB, and publishes to the Redis
-  `mission-alerts` stream.
-- **Frontend** — React/Vite dashboard for `SAT-001` telemetry, health, alerts,
-  and dependencies.
+- **API** - Gives telemetry, health, alerts, and sensor relationship data to the frontend.
+- **Ingestion** - Creates sample satellite telemetry and saves it to the databases.
+- **Alert** - Checks satellite health and creates alerts when values are unsafe.
+- **Frontend** - Shows satellite information on a React dashboard.
 
-## NoSQL models
+## Why Four NoSQL Databases?
 
-- **MongoDB:** flexible `telemetry` and `alerts` documents in database
-  `telemetry`; both collections partition by `satellite_id` and index
-  `timestamp` for application sorting.
-- **Redis:** expiring `satellite:{id}:health` hashes for current state and the
-  bounded `mission-alerts` stream for ephemeral alert delivery.
-- **Cassandra:** historical rows in `telemetry.telemetry_by_satellite`, keyed
-  by `((satellite_id), timestamp, sensor_id)` with newest timestamps first.
-- **Neo4j:** `(:Satellite)-[:HAS_SENSOR]->(:Sensor)` relationships for graph
-  dependency and latest sensor-state queries.
+This project uses different databases for different types of data.
 
-## Local development
+- **MongoDB** - Stores telemetry records and alerts as documents.
+- **Redis** - Stores the latest satellite health data for fast access.
+- **Cassandra** - Stores historical telemetry and time-series data.
+- **Neo4j** - Stores relationships between satellites and sensors.
+
+This approach allows each database to do the job it is best suited for.
+
+## Alert Rules
+
+The system currently checks two important conditions:
+
+- High temperature: above **80°C**
+- Low battery: below **20%**
+
+When these conditions happen, the alert service creates an alert for the mission-control dashboard.
+
+## Run Locally
+
+First create the local environment file:
 
 ```bash
 cp .env.example .env
+```
+
+Start the Docker services:
+
+```bash
 docker compose up --build
 ```
 
-Local endpoints: API `:8000`, ingestion `:8001`, alert `:8002`, and Neo4j
-Browser `:7474`.
+Local services:
+
+- API: `http://localhost:8000`
+- Ingestion: `http://localhost:8001`
+- Alert: `http://localhost:8002`
+- Neo4j Browser: `http://localhost:7474`
+
+Generate sample telemetry:
 
 ```bash
 curl -X POST "http://localhost:8001/generate?satellite_id=SAT-001&count=5"
-curl http://localhost:8000/health
-curl http://localhost:8000/api/v1/satellites/SAT-001/telemetry
-curl http://localhost:8000/api/v1/satellites/SAT-001/health
-curl http://localhost:8000/api/v1/satellites/SAT-001/dependencies
-curl http://localhost:8000/api/v1/alerts
 ```
 
-## Deployment and CI/CD
+Check the API health:
 
-Backend images are built for `linux/amd64`, tagged with the Git commit SHA,
-and stored in Basic ACR. Container Apps use system-assigned identities with
-`AcrPull` scoped only to ACR; ACR admin is disabled. Deployment authenticates
-with GitHub OIDC, updates all three apps, deploys Vite, and checks API health.
+```bash
+curl http://localhost:8000/health
+```
 
-Required GitHub secrets contain only OIDC identifiers: `AZURE_CLIENT_ID`,
-`AZURE_TENANT_ID`, and `AZURE_SUBSCRIPTION_ID`. Production datastore
-credentials remain Container App secrets and are not stored in GitHub or
-Terraform.
+To run the frontend:
 
-## Monitoring and security
+```bash
+cd frontend
+npm install
+npm run dev
+```
 
-Container Apps send console logs to the existing 30-day Log Analytics
-workspace. Revision health, replica state, and `/health` endpoints provide
-low-cost operational checks. No additional billable monitoring resource is
-enabled for this demo.
+Then open the local Vite URL shown in the terminal, normally `http://localhost:5173`.
 
-All public endpoints use HTTPS. Redis and Cassandra require TLS; Aura uses
-`neo4j+s://`; credentials are secret references. Production CORS is restricted
-to the deployed dashboard and local Vite origins.
+## Azure Deployment
 
-## Cost choices
+The production backend is deployed using Azure Container Apps.
 
-- Cosmos MongoDB: free tier, shared 400 RU/s.
-- Cosmos Cassandra: serverless, pay per request.
-- Azure Managed Redis: smallest `Balanced_B0`, one node, no HA/persistence.
-- Neo4j AuraDB and Static Web Apps: Free.
-- Container Apps: 0.25 CPU/0.5 GiB, max one replica, scale to zero.
-- ACR: Basic; Log Analytics reuses the environment workspace.
+Docker images are stored in Azure Container Registry. The frontend is deployed using Azure Static Web Apps.
 
-## Verification
+The three backend services are:
+
+- `space-telemetry-api`
+- `space-telemetry-ingestion`
+- `space-telemetry-alert`
+
+The project uses small and low-cost cloud resources because it is a capstone/demo project.
+
+## CI/CD
+
+GitHub Actions automatically tests and deploys the project.
+
+The deployment process:
+
+1. Runs tests.
+2. Builds the frontend.
+3. Logs in to Azure using OIDC.
+4. Builds Linux/AMD64 Docker images.
+5. Pushes the images to Azure Container Registry.
+6. Updates the Azure Container Apps.
+7. Deploys the frontend.
+8. Checks the production API health.
+
+OIDC is used so a permanent Azure client secret is not required in GitHub.
+
+## Security
+
+- Credentials are not stored in the source code.
+- Sensitive values use Azure Container App secrets.
+- Public production endpoints use HTTPS.
+- Database connections use secure connections.
+- Azure Container Registry admin access is disabled.
+- Container Apps use managed identities.
+- CORS only allows the production frontend and approved local development addresses.
+
+## Monitoring
+
+Azure Container Apps logs are sent to Log Analytics.
+
+We can use Azure to check:
+
+- Application logs
+- Container App revisions
+- Replica health
+- API health
+
+The `/health` endpoint also checks whether MongoDB, Redis, Cassandra, and Neo4j are connected.
+
+A healthy production response looks like this:
+
+```json
+{
+  "status": "ok",
+  "checks": {
+    "mongodb": "ok",
+    "redis": "ok",
+    "cassandra": "ok",
+    "neo4j": "ok"
+  }
+}
+```
+
+## Infrastructure as Code
+
+Terraform files are available in:
+
+```text
+infrastructure/terraform/
+```
+
+They describe the main Azure infrastructure used by this project.
+
+## Testing
+
+Useful verification commands:
 
 ```bash
 pytest -q
@@ -123,5 +195,27 @@ docker compose config -q
 git diff --check
 ```
 
-Never commit `.env`, Terraform state, credentials, connection strings, access
-keys, deployment tokens, or downloaded Aura credential files.
+## Technologies Used
+
+- Python
+- FastAPI
+- React
+- Vite
+- Docker
+- MongoDB
+- Redis
+- Cassandra
+- Neo4j
+- Microsoft Azure
+- Terraform
+- GitHub Actions
+
+## Project Summary
+
+This project shows how different NoSQL databases can work together in one cloud application.
+
+Satellite telemetry is generated by the ingestion service. The data is stored in MongoDB, Redis, Cassandra, and Neo4j based on its purpose. The API reads the information and sends it to the dashboard. The alert service checks important satellite values and creates alerts when there is a problem.
+
+The complete application can run locally with Docker and is also deployed to Azure.
+
+> Important: Never commit `.env` files, passwords, database connection strings, access keys, Terraform state files, or downloaded credential files to GitHub.
