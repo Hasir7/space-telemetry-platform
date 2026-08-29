@@ -1,6 +1,8 @@
 # MongoDB model
 
-`telemetry_packets` stores complete telemetry packets as flexible documents.
+The `telemetry` database contains two collections.
+
+`telemetry` stores complete telemetry packets as flexible documents.
 
 `alerts` stores generated mission alerts.
 

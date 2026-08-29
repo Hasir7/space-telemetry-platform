@@ -1,5 +1,6 @@
 import os
 import random
+import ssl
 import time
 import uuid
 from datetime import datetime, timezone
@@ -7,7 +8,6 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Query
 from pymongo import MongoClient
 import redis
-from cassandra.cluster import Cluster
 from neo4j import GraphDatabase
 
 
@@ -28,7 +28,7 @@ MONGO_URI = os.getenv(
 
 MONGO_DB = os.getenv(
     "MONGO_DB",
-    "space_telemetry",
+    "telemetry",
 )
 
 REDIS_URL = os.getenv(
@@ -41,10 +41,18 @@ CASSANDRA_HOST = os.getenv(
     "cassandra",
 )
 
+CASSANDRA_PORT = int(os.getenv("CASSANDRA_PORT", "9042"))
+
 CASSANDRA_KEYSPACE = os.getenv(
     "CASSANDRA_KEYSPACE",
     "telemetry",
 )
+
+CASSANDRA_USERNAME = os.getenv("CASSANDRA_USERNAME", "")
+CASSANDRA_PASSWORD = os.getenv("CASSANDRA_PASSWORD", "")
+CASSANDRA_SSL = os.getenv("CASSANDRA_SSL", "false").lower() in {
+    "1", "true", "yes", "on"
+}
 
 NEO4J_URI = os.getenv(
     "NEO4J_URI",
@@ -78,6 +86,33 @@ neo4j_driver = None
 # Cassandra connection
 # ============================================================
 
+def create_cassandra_cluster(cluster_factory=None, auth_provider_factory=None):
+    if cluster_factory is None:
+        from cassandra.cluster import Cluster
+        cluster_factory = Cluster
+
+    if auth_provider_factory is None:
+        from cassandra.auth import PlainTextAuthProvider
+        auth_provider_factory = PlainTextAuthProvider
+
+    cluster_options = {"port": CASSANDRA_PORT}
+
+    if bool(CASSANDRA_USERNAME) != bool(CASSANDRA_PASSWORD):
+        raise ValueError(
+            "CASSANDRA_USERNAME and CASSANDRA_PASSWORD must be set together"
+        )
+
+    if CASSANDRA_USERNAME:
+        cluster_options["auth_provider"] = auth_provider_factory(
+            username=CASSANDRA_USERNAME,
+            password=CASSANDRA_PASSWORD,
+        )
+
+    if CASSANDRA_SSL:
+        cluster_options["ssl_context"] = ssl.create_default_context()
+
+    return cluster_factory([CASSANDRA_HOST], **cluster_options)
+
 def connect_cassandra():
     """
     Connect to the existing Cassandra keyspace.
@@ -99,10 +134,7 @@ def connect_cassandra():
                 flush=True,
             )
 
-            cassandra_cluster = Cluster(
-                [CASSANDRA_HOST],
-                port=9042,
-            )
+            cassandra_cluster = create_cassandra_cluster()
 
             cassandra_session = cassandra_cluster.connect(
                 CASSANDRA_KEYSPACE

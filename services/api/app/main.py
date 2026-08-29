@@ -1,4 +1,5 @@
 import os
+import ssl
 from datetime import datetime, timezone
 from typing import Any
 
@@ -6,10 +7,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
 import redis
-from cassandra.cluster import Cluster
 from neo4j import GraphDatabase
 
-from app.config import get_cors_origins
+from .config import get_cors_origins
 
 
 # ============================================================
@@ -42,6 +42,13 @@ CASSANDRA_PORT = int(
         "9042"
     )
 )
+
+CASSANDRA_KEYSPACE = os.getenv("CASSANDRA_KEYSPACE", "telemetry")
+CASSANDRA_USERNAME = os.getenv("CASSANDRA_USERNAME", "")
+CASSANDRA_PASSWORD = os.getenv("CASSANDRA_PASSWORD", "")
+CASSANDRA_SSL = os.getenv("CASSANDRA_SSL", "false").lower() in {
+    "1", "true", "yes", "on"
+}
 
 NEO4J_URI = os.getenv(
     "NEO4J_URI",
@@ -101,6 +108,33 @@ neo4j_driver = None
 # STARTUP
 # ============================================================
 
+def create_cassandra_cluster(cluster_factory=None, auth_provider_factory=None):
+    if cluster_factory is None:
+        from cassandra.cluster import Cluster
+        cluster_factory = Cluster
+
+    if auth_provider_factory is None:
+        from cassandra.auth import PlainTextAuthProvider
+        auth_provider_factory = PlainTextAuthProvider
+
+    cluster_options = {"port": CASSANDRA_PORT}
+
+    if bool(CASSANDRA_USERNAME) != bool(CASSANDRA_PASSWORD):
+        raise ValueError(
+            "CASSANDRA_USERNAME and CASSANDRA_PASSWORD must be set together"
+        )
+
+    if CASSANDRA_USERNAME:
+        cluster_options["auth_provider"] = auth_provider_factory(
+            username=CASSANDRA_USERNAME,
+            password=CASSANDRA_PASSWORD,
+        )
+
+    if CASSANDRA_SSL:
+        cluster_options["ssl_context"] = ssl.create_default_context()
+
+    return cluster_factory([CASSANDRA_HOST], **cluster_options)
+
 @app.on_event("startup")
 def startup():
     global mongo_client
@@ -154,12 +188,9 @@ def startup():
     # --------------------------------------------------------
 
     try:
-        cassandra_cluster = Cluster(
-            [CASSANDRA_HOST],
-            port=CASSANDRA_PORT
-        )
+        cassandra_cluster = create_cassandra_cluster()
 
-        cassandra_session = cassandra_cluster.connect()
+        cassandra_session = cassandra_cluster.connect(CASSANDRA_KEYSPACE)
 
         print("Cassandra connected")
 
@@ -462,7 +493,6 @@ def get_telemetry(
         try:
             query = """
                 SELECT
-                    telemetry_id,
                     satellite_id,
                     timestamp,
                     sensor_id,
@@ -472,7 +502,7 @@ def get_telemetry(
                     cpu_pct,
                     signal_dbm,
                     status
-                FROM telemetry
+                FROM telemetry_by_satellite
                 WHERE satellite_id = %s
                 LIMIT %s
             """
@@ -490,9 +520,6 @@ def get_telemetry(
             for row in rows:
 
                 item = {
-                    "telemetry_id": str(
-                        row.telemetry_id
-                    ),
                     "satellite_id": row.satellite_id,
                     "timestamp": (
                         row.timestamp.isoformat()
