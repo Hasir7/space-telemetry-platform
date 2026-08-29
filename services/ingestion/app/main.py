@@ -95,7 +95,11 @@ def create_cassandra_cluster(cluster_factory=None, auth_provider_factory=None):
         from cassandra.auth import PlainTextAuthProvider
         auth_provider_factory = PlainTextAuthProvider
 
-    cluster_options = {"port": CASSANDRA_PORT}
+    cluster_options = {
+        "port": CASSANDRA_PORT,
+        "protocol_version": 4,
+        "connect_timeout": 20,
+    }
 
     if bool(CASSANDRA_USERNAME) != bool(CASSANDRA_PASSWORD):
         raise ValueError(
@@ -110,6 +114,9 @@ def create_cassandra_cluster(cluster_factory=None, auth_provider_factory=None):
 
     if CASSANDRA_SSL:
         cluster_options["ssl_context"] = ssl.create_default_context()
+        cluster_options["ssl_options"] = {
+            "server_hostname": CASSANDRA_HOST,
+        }
 
     return cluster_factory([CASSANDRA_HOST], **cluster_options)
 

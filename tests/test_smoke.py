@@ -84,8 +84,13 @@ def test_cassandra_tls_and_auth_configuration(monkeypatch, module_name):
 
     assert captured["hosts"] == ["db.example.com"]
     assert captured["options"]["port"] == 9142
+    assert captured["options"]["protocol_version"] == 4
+    assert captured["options"]["connect_timeout"] == 20
     assert captured["options"]["auth_provider"] is not None
     assert isinstance(captured["options"]["ssl_context"], object)
+    assert captured["options"]["ssl_options"] == {
+        "server_hostname": "db.example.com"
+    }
 
 
 def test_cassandra_local_defaults_do_not_require_tls_or_auth(monkeypatch):
@@ -106,6 +111,9 @@ def test_cassandra_local_defaults_do_not_require_tls_or_auth(monkeypatch):
     )
     assert "auth_provider" not in captured["options"]
     assert "ssl_context" not in captured["options"]
+    assert "ssl_options" not in captured["options"]
+    assert captured["options"]["protocol_version"] == 4
+    assert captured["options"]["connect_timeout"] == 20
 
 
 def test_alert_low_battery_uses_requested_satellite_id(monkeypatch):
@@ -139,6 +147,31 @@ def test_alert_low_battery_uses_requested_satellite_id(monkeypatch):
     assert result["alerts"][0]["type"] == "LOW_BATTERY"
     assert stored_alerts[0]["satellite_id"] == "SAT-LOW"
     assert published_alerts[0][1]["satellite_id"] == "SAT-LOW"
+
+
+def test_alert_health_checks_mongodb_and_redis(monkeypatch):
+    from services.alert.app import main as alert_main
+
+    class FakeAdmin:
+        @staticmethod
+        def command(command):
+            assert command == "ping"
+
+    class FakeMongo:
+        admin = FakeAdmin()
+
+    class FakeRedis:
+        @staticmethod
+        def ping():
+            return True
+
+    monkeypatch.setattr(alert_main, "mongo", FakeMongo())
+    monkeypatch.setattr(alert_main, "r", FakeRedis())
+
+    assert alert_main.health() == {
+        "status": "ok",
+        "checks": {"mongodb": "ok", "redis": "ok"},
+    }
 
 
 def test_api_cors_origins_are_configurable_with_local_defaults(monkeypatch):

@@ -13,7 +13,29 @@ r = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), dec
 def root(): return {"service": "alert", "version": "0.1.0"}
 
 @app.get("/health")
-def health(): return {"status": "ok"}
+def health():
+    checks = {}
+
+    try:
+        mongo.admin.command("ping")
+        checks["mongodb"] = "ok"
+    except Exception:
+        checks["mongodb"] = "down"
+
+    try:
+        r.ping()
+        checks["redis"] = "ok"
+    except Exception:
+        checks["redis"] = "down"
+
+    return {
+        "status": (
+            "ok"
+            if all(value == "ok" for value in checks.values())
+            else "degraded"
+        ),
+        "checks": checks,
+    }
 
 @app.post("/evaluate/{satellite_id}")
 def evaluate(satellite_id: str):
