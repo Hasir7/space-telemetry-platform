@@ -30,3 +30,21 @@ jobs:
         run: python -m compileall app
       - name: Tests
         run: python -m pytest -q tests
+
+  frontend-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Build
+        working-directory: frontend
+        env:
+          VITE_API_URL: https://space-telemetry-api.mangosea-feb17010.southindia.azurecontainerapps.io
+        run: npm run build

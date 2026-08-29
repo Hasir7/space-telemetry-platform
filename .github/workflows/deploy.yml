@@ -1,0 +1,117 @@
+name: Deploy to Azure
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+env:
+  ACR_NAME: spacetelemetryacr
+  ACR_LOGIN_SERVER: spacetelemetryacr.azurecr.io
+  RESOURCE_GROUP: space-telemetry-rg
+  API_URL: https://space-telemetry-api.mangosea-feb17010.southindia.azurecontainerapps.io
+  STATIC_WEB_APP: space-telemetry-dashboard-hasir
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: |
+          pip install -r services/api/requirements.txt
+          pip install pytest
+      - name: Test and compile
+        run: |
+          pytest -q
+          python -m compileall services/api/app
+          python -m compileall services/ingestion/app
+          python -m compileall services/alert/app
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          VITE_API_URL: ${{ env.API_URL }}
+        run: |
+          npm ci
+          npm run build
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Sign in to ACR without admin credentials
+        run: az acr login --name "$ACR_NAME"
+      - name: Build and push linux/amd64 backend images
+        run: |
+          for service in api ingestion alert; do
+            docker buildx build \
+              --platform linux/amd64 \
+              --tag "$ACR_LOGIN_SERVER/space-telemetry-$service:${GITHUB_SHA}" \
+              --push \
+              "services/$service"
+          done
+      - name: Update Container Apps
+        run: |
+          az containerapp update \
+            --name space-telemetry-api \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$ACR_LOGIN_SERVER/space-telemetry-api:${GITHUB_SHA}"
+          az containerapp update \
+            --name space-telemetry-ingestion \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$ACR_LOGIN_SERVER/space-telemetry-ingestion:${GITHUB_SHA}"
+          az containerapp update \
+            --name space-telemetry-alert \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$ACR_LOGIN_SERVER/space-telemetry-alert:${GITHUB_SHA}"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build production frontend
+        working-directory: frontend
+        env:
+          VITE_API_URL: ${{ env.API_URL }}
+        run: |
+          npm ci
+          npm run build
+      - name: Deploy Static Web App
+        working-directory: frontend
+        run: |
+          deployment_token="$(az staticwebapp secrets list \
+            --name "$STATIC_WEB_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query properties.apiKey \
+            --output tsv)"
+          SWA_CLI_DEPLOYMENT_TOKEN="$deployment_token" \
+            npx --yes @azure/static-web-apps-cli deploy ./dist --env production
+          unset deployment_token
+      - name: Verify production health
+        run: |
+          curl --fail --retry 6 --retry-delay 10 --max-time 30 "$API_URL/health"
