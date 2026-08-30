@@ -142,6 +142,7 @@ def create_cassandra_cluster(cluster_factory=None, auth_provider_factory=None):
 
     return cluster_factory([CASSANDRA_HOST], **cluster_options)
 
+
 @app.on_event("startup")
 def startup():
     global mongo_client
@@ -151,78 +152,46 @@ def startup():
     global cassandra_session
     global neo4j_driver
 
-    # --------------------------------------------------------
-    # MongoDB
-    # --------------------------------------------------------
-
     try:
         mongo_client = MongoClient(
             MONGO_URI,
             serverSelectionTimeoutMS=3000
         )
-
         mongo_client.admin.command("ping")
-
         mongo_db = mongo_client[MONGO_DB]
-
         print("MongoDB connected")
-
     except Exception as exc:
         print(f"MongoDB connection failed: {exc}")
         mongo_client = None
         mongo_db = None
-
-    # --------------------------------------------------------
-    # Redis
-    # --------------------------------------------------------
 
     try:
         redis_client = redis.from_url(
             REDIS_URL,
             decode_responses=True
         )
-
         redis_client.ping()
-
         print("Redis connected")
-
     except Exception as exc:
         print(f"Redis connection failed: {exc}")
         redis_client = None
 
-    # --------------------------------------------------------
-    # Cassandra
-    # --------------------------------------------------------
-
     try:
         cassandra_cluster = create_cassandra_cluster()
-
         cassandra_session = cassandra_cluster.connect(CASSANDRA_KEYSPACE)
-
         print("Cassandra connected")
-
     except Exception as exc:
         print(f"Cassandra connection failed: {exc}")
         cassandra_cluster = None
         cassandra_session = None
 
-    # --------------------------------------------------------
-    # Neo4j
-    # --------------------------------------------------------
-
     try:
         neo4j_driver = GraphDatabase.driver(
             NEO4J_URI,
-            auth=(
-                NEO4J_USER,
-                NEO4J_PASSWORD
-            )
+            auth=(NEO4J_USER, NEO4J_PASSWORD)
         )
-
         neo4j_driver.verify_connectivity()
-
         print("Neo4j connected")
-
     except Exception as exc:
         print(f"Neo4j connection failed: {exc}")
         neo4j_driver = None
@@ -253,10 +222,7 @@ def shutdown():
 # ============================================================
 
 def make_json_safe(value: Any):
-    """
-    Convert MongoDB / Neo4j / Cassandra values into
-    JSON-safe Python values.
-    """
+    """Convert database values into JSON-safe Python values."""
 
     if value is None:
         return None
@@ -271,16 +237,11 @@ def make_json_safe(value: Any):
         }
 
     if isinstance(value, list):
-        return [
-            make_json_safe(v)
-            for v in value
-        ]
+        return [make_json_safe(v) for v in value]
 
-    # MongoDB ObjectId
     if value.__class__.__name__ == "ObjectId":
         return str(value)
 
-    # Neo4j Node
     if value.__class__.__name__ == "Node":
         return {
             str(k): make_json_safe(v)
@@ -290,20 +251,21 @@ def make_json_safe(value: Any):
     return value
 
 
-def get_redis_health(satellite_id: str):
+def normalize_health_data(data):
     """
-    Read current satellite health from Redis.
+    Normalize current-health data for the frontend.
+
+    Redis stores the time as ``timestamp`` while the dashboard expects
+    ``last_seen``. Persistent fallbacks also use the same output shape.
     """
-
-    if redis_client is None:
-        return None
-
-    key = f"satellite:{satellite_id}:health"
-
-    data = redis_client.hgetall(key)
 
     if not data:
         return None
+
+    normalized = dict(data)
+
+    if not normalized.get("last_seen") and normalized.get("timestamp"):
+        normalized["last_seen"] = normalized["timestamp"]
 
     numeric_fields = [
         "temperature_c",
@@ -314,13 +276,117 @@ def get_redis_health(satellite_id: str):
     ]
 
     for field in numeric_fields:
-        if field in data:
+        if field in normalized and normalized[field] is not None:
             try:
-                data[field] = float(data[field])
+                normalized[field] = float(normalized[field])
             except (TypeError, ValueError):
                 pass
 
-    return data
+    return make_json_safe(normalized)
+
+
+def get_redis_health(satellite_id: str):
+    """Read current satellite health from Redis."""
+
+    if redis_client is None:
+        return None
+
+    key = f"satellite:{satellite_id}:health"
+
+    try:
+        data = redis_client.hgetall(key)
+    except Exception as exc:
+        print(f"Redis health read error: {exc}")
+        return None
+
+    return normalize_health_data(data)
+
+
+def get_mongo_health(satellite_id: str):
+    """Read the newest persistent telemetry document from MongoDB."""
+
+    if mongo_db is None:
+        return None
+
+    try:
+        document = mongo_db.telemetry.find_one(
+            {"satellite_id": satellite_id},
+            sort=[("timestamp", -1)],
+        )
+
+        if not document:
+            return None
+
+        document.pop("_id", None)
+        return normalize_health_data(document)
+
+    except Exception as exc:
+        print(f"MongoDB health fallback error: {exc}")
+        return None
+
+
+def get_cassandra_health(satellite_id: str):
+    """Read the newest telemetry row from Cassandra as a final fallback."""
+
+    if cassandra_session is None:
+        return None
+
+    try:
+        query = """
+            SELECT
+                satellite_id,
+                timestamp,
+                sensor_id,
+                temperature_c,
+                voltage_v,
+                battery_pct,
+                cpu_pct,
+                signal_dbm,
+                status
+            FROM telemetry_by_satellite
+            WHERE satellite_id = %s
+            LIMIT 1
+        """
+
+        row = cassandra_session.execute(
+            query,
+            (satellite_id,)
+        ).one()
+
+        if row is None:
+            return None
+
+        return normalize_health_data({
+            "satellite_id": row.satellite_id,
+            "timestamp": row.timestamp,
+            "sensor_id": row.sensor_id,
+            "temperature_c": row.temperature_c,
+            "voltage_v": row.voltage_v,
+            "battery_pct": row.battery_pct,
+            "cpu_pct": row.cpu_pct,
+            "signal_dbm": row.signal_dbm,
+            "status": row.status,
+        })
+
+    except Exception as exc:
+        print(f"Cassandra health fallback error: {exc}")
+        return None
+
+
+def get_current_health(satellite_id: str):
+    """
+    Return the best available current-health snapshot.
+
+    Redis is preferred for low latency. If its temporary key has expired,
+    MongoDB supplies the latest persistent telemetry record. Cassandra is the
+    final persistent fallback.
+    """
+
+    return (
+        get_redis_health(satellite_id)
+        or get_mongo_health(satellite_id)
+        or get_cassandra_health(satellite_id)
+    )
 
 
 # ============================================================
@@ -349,7 +415,6 @@ def health():
         "neo4j": "down",
     }
 
-    # MongoDB
     try:
         if mongo_client:
             mongo_client.admin.command("ping")
@@ -357,7 +422,6 @@ def health():
     except Exception:
         checks["mongodb"] = "down"
 
-    # Redis
     try:
         if redis_client:
             redis_client.ping()
@@ -365,17 +429,13 @@ def health():
     except Exception:
         checks["redis"] = "down"
 
-    # Cassandra
     try:
         if cassandra_session:
-            cassandra_session.execute(
-                "SELECT now() FROM system.local"
-            )
+            cassandra_session.execute("SELECT now() FROM system.local")
             checks["cassandra"] = "ok"
     except Exception:
         checks["cassandra"] = "down"
 
-    # Neo4j
     try:
         if neo4j_driver:
             neo4j_driver.verify_connectivity()
@@ -385,18 +445,13 @@ def health():
 
     overall = (
         "ok"
-        if all(
-            value == "ok"
-            for value in checks.values()
-        )
+        if all(value == "ok" for value in checks.values())
         else "degraded"
     )
 
     return {
         "status": overall,
-        "timestamp": datetime.now(
-            timezone.utc
-        ).isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "checks": checks,
     }
 
@@ -406,18 +461,8 @@ def health():
 # ============================================================
 
 @app.get("/api/v1/satellites/{satellite_id}/health")
-def get_satellite_health(
-    satellite_id: str
-):
-    health_data = get_redis_health(
-        satellite_id
-    )
-
-    if health_data is None:
-        return {
-            "satellite_id": satellite_id,
-            "health": None
-        }
+def get_satellite_health(satellite_id: str):
+    health_data = get_current_health(satellite_id)
 
     return {
         "satellite_id": satellite_id,
@@ -429,55 +474,29 @@ def get_satellite_health(
 # TELEMETRY
 # ============================================================
 
-@app.get(
-    "/api/v1/satellites/{satellite_id}/telemetry"
-)
+@app.get("/api/v1/satellites/{satellite_id}/telemetry")
 def get_telemetry(
     satellite_id: str,
     limit: int = 20
 ):
-    limit = max(
-        1,
-        min(limit, 200)
-    )
-
-    # --------------------------------------------------------
-    # MongoDB
-    # --------------------------------------------------------
+    limit = max(1, min(limit, 200))
 
     if mongo_db is not None:
-
         try:
             collection = mongo_db.telemetry
 
             cursor = (
                 collection
-                .find(
-                    {
-                        "satellite_id": satellite_id
-                    }
-                )
-                .sort(
-                    "timestamp",
-                    -1
-                )
+                .find({"satellite_id": satellite_id})
+                .sort("timestamp", -1)
                 .limit(limit)
             )
 
             items = []
 
             for document in cursor:
-
-                document.pop(
-                    "_id",
-                    None
-                )
-
-                items.append(
-                    make_json_safe(
-                        document
-                    )
-                )
+                document.pop("_id", None)
+                items.append(make_json_safe(document))
 
             if items:
                 return {
@@ -487,16 +506,9 @@ def get_telemetry(
                 }
 
         except Exception as exc:
-            print(
-                f"MongoDB telemetry error: {exc}"
-            )
-
-    # --------------------------------------------------------
-    # Cassandra fallback
-    # --------------------------------------------------------
+            print(f"MongoDB telemetry error: {exc}")
 
     if cassandra_session is not None:
-
         try:
             query = """
                 SELECT
@@ -516,16 +528,12 @@ def get_telemetry(
 
             rows = cassandra_session.execute(
                 query,
-                (
-                    satellite_id,
-                    limit
-                )
+                (satellite_id, limit)
             )
 
             items = []
 
             for row in rows:
-
                 item = {
                     "satellite_id": row.satellite_id,
                     "timestamp": (
@@ -542,9 +550,7 @@ def get_telemetry(
                     "status": row.status,
                 }
 
-                items.append(
-                    make_json_safe(item)
-                )
+                items.append(make_json_safe(item))
 
             return {
                 "satellite_id": satellite_id,
@@ -553,9 +559,7 @@ def get_telemetry(
             }
 
         except Exception as exc:
-            print(
-                f"Cassandra telemetry error: {exc}"
-            )
+            print(f"Cassandra telemetry error: {exc}")
 
     return {
         "satellite_id": satellite_id,
@@ -577,31 +581,18 @@ def get_alerts():
         }
 
     try:
-
         cursor = (
             mongo_db.alerts
             .find({})
-            .sort(
-                "timestamp",
-                -1
-            )
+            .sort("timestamp", -1)
             .limit(50)
         )
 
         items = []
 
         for document in cursor:
-
-            document.pop(
-                "_id",
-                None
-            )
-
-            items.append(
-                make_json_safe(
-                    document
-                )
-            )
+            document.pop("_id", None)
+            items.append(make_json_safe(document))
 
         return {
             "count": len(items),
@@ -609,11 +600,7 @@ def get_alerts():
         }
 
     except Exception as exc:
-
-        print(
-            f"MongoDB alerts error: {exc}"
-        )
-
+        print(f"MongoDB alerts error: {exc}")
         return {
             "count": 0,
             "items": []
@@ -624,13 +611,8 @@ def get_alerts():
 # NEO4J DEPENDENCIES
 # ============================================================
 
-@app.get(
-    "/api/v1/satellites/{satellite_id}/dependencies"
-)
-def get_dependencies(
-    satellite_id: str
-):
-
+@app.get("/api/v1/satellites/{satellite_id}/dependencies")
+def get_dependencies(satellite_id: str):
     if neo4j_driver is None:
         return {
             "satellite_id": satellite_id,
@@ -650,9 +632,7 @@ def get_dependencies(
     """
 
     try:
-
         with neo4j_driver.session() as session:
-
             result = session.run(
                 query,
                 satellite_id=satellite_id
@@ -661,49 +641,26 @@ def get_dependencies(
             dependencies = []
 
             for record in result:
-
                 sensor = record["sensor"]
 
                 dependencies.append({
-                    "sensor_id": sensor.get(
-                        "sensor_id"
-                    ),
-                    "last_seen": sensor.get(
-                        "last_seen"
-                    ),
-                    "temperature": sensor.get(
-                        "last_temperature"
-                    ),
-                    "battery": sensor.get(
-                        "last_battery"
-                    ),
-                    "voltage": sensor.get(
-                        "last_voltage"
-                    ),
-                    "cpu": sensor.get(
-                        "last_cpu"
-                    ),
-                    "signal": sensor.get(
-                        "last_signal"
-                    ),
-                    "status": sensor.get(
-                        "last_status"
-                    ),
+                    "sensor_id": sensor.get("sensor_id"),
+                    "last_seen": sensor.get("last_seen"),
+                    "temperature": sensor.get("last_temperature"),
+                    "battery": sensor.get("last_battery"),
+                    "voltage": sensor.get("last_voltage"),
+                    "cpu": sensor.get("last_cpu"),
+                    "signal": sensor.get("last_signal"),
+                    "status": sensor.get("last_status"),
                 })
 
         return {
             "satellite_id": satellite_id,
-            "dependencies": make_json_safe(
-                dependencies
-            )
+            "dependencies": make_json_safe(dependencies)
         }
 
     except Exception as exc:
-
-        print(
-            f"Neo4j dependency error: {exc}"
-        )
-
+        print(f"Neo4j dependency error: {exc}")
         raise HTTPException(
             status_code=500,
             detail=str(exc)
@@ -714,21 +671,13 @@ def get_dependencies(
 # SATELLITE SUMMARY
 # ============================================================
 
-@app.get(
-    "/api/v1/satellites/{satellite_id}"
-)
-def get_satellite(
-    satellite_id: str
-):
-
-    health_data = get_redis_health(
-        satellite_id
-    )
+@app.get("/api/v1/satellites/{satellite_id}")
+def get_satellite(satellite_id: str):
+    health_data = get_current_health(satellite_id)
 
     dependencies = []
 
     if neo4j_driver is not None:
-
         query = """
             MATCH (
                 s:Satellite
@@ -742,44 +691,29 @@ def get_satellite(
         """
 
         try:
-
             with neo4j_driver.session() as session:
-
                 result = session.run(
                     query,
                     satellite_id=satellite_id
                 )
 
                 for record in result:
-
                     sensor = record["sensor"]
 
                     dependencies.append({
-                        "sensor_id": sensor.get(
-                            "sensor_id"
-                        ),
-                        "status": sensor.get(
-                            "last_status"
-                        ),
-                        "temperature": sensor.get(
-                            "last_temperature"
-                        ),
-                        "battery": sensor.get(
-                            "last_battery"
-                        ),
+                        "sensor_id": sensor.get("sensor_id"),
+                        "status": sensor.get("last_status"),
+                        "temperature": sensor.get("last_temperature"),
+                        "battery": sensor.get("last_battery"),
                     })
 
         except Exception as exc:
-            print(
-                f"Neo4j summary error: {exc}"
-            )
+            print(f"Neo4j summary error: {exc}")
 
     return {
         "satellite_id": satellite_id,
         "health": health_data,
-        "sensor_count": len(
-            dependencies
-        ),
+        "sensor_count": len(dependencies),
         "dependencies": dependencies
     }
 
@@ -789,7 +723,6 @@ def get_satellite(
 # ============================================================
 
 if __name__ == "__main__":
-
     import uvicorn
 
     uvicorn.run(
